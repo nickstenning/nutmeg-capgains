@@ -24,7 +24,11 @@ def iter_results(cur):
 def find_year_dividends(cur, year):
     cur.execute(
         """
-        select date, assetcode, total
+        select 
+            date, 
+            assetcode, 
+            total,
+            (select rate from fx where date <= activities.date order by date desc limit 1) as gbpeur_rate
         from activities
         where description = 'Dividend'
         and date > date(? || '-01-01')
@@ -46,6 +50,7 @@ def find_year_sales(cur, year):
             sales.quantity as sale_quantity,
             sales.price as sale_price,
             sales.total as sale_total,
+            (select rate from fx where date <= sales.date order by date desc limit 1) as sale_gbpeur_rate,
             reconciliation.quantity as reconciliation_quantity,
             purchases.id as purchase_id,
             purchases.date as purchase_date,
@@ -69,33 +74,46 @@ def qty(quantity):
     return D(quantity) / QTY_FACTOR
 
 
-def single_sale_summary(sale_total, purchase_total):
+def single_sale_summary(sale_total, purchase_total, exchange_rate):
+    profit = sale_total - purchase_total
     print()
     print(f"    Sale amount            {sale_total:12.4f}")
     print(f"    Cost basis           - {purchase_total:12.4f}")
-    print(f"    Profit               = {sale_total - purchase_total:12.4f}")
+    print(f"    Profit               = {profit:12.4f}")
+    print(f"    GBP/EUR              / {exchange_rate:12.4f}")
+    print(f"    Profit (EUR)         = {profit / exchange_rate:12.4f}")
 
 
 def dividends_summary(conn, year):
     cur = conn.cursor()
 
     year_dividends = D(0)
+    year_dividends_eur = D(0)
 
     dividends = list(find_year_dividends(cur, year))
 
+    print(f"Date        Ticker  Amount/GBP  GBP/EUR  Amount/EUR")
     for d in dividends:
-        print(f"{d['date']} ({d['assetcode']}): {d['total']}")
-        year_dividends += D(d["total"])
+        gbpeur_rate = D(d["gbpeur_rate"])
+        total = D(d["total"])
+        total_eur = total / gbpeur_rate
+        print(
+            f"{d['date']}  {d['assetcode']:6}  {total:10.2f}  {gbpeur_rate:7.4f}  {total_eur:10.2f}"
+        )
+        year_dividends += total
+        year_dividends_eur += total_eur
 
-    return year_dividends
+    return year_dividends, year_dividends_eur
 
 
 def capital_gains_summary(conn, year):
     cur = conn.cursor()
 
     year_profit = D(0)
+    year_profit_eur = D(0)
     purchase_total = None
     current_sale = None
+    current_sale_exchange_rate = None
     current_sale_total = None
 
     sales = list(find_year_sales(cur, year))
@@ -106,17 +124,23 @@ def capital_gains_summary(conn, year):
     for e in sales:
         if e["sale_id"] != current_sale:
             if current_sale is not None:
-                single_sale_summary(current_sale_total, purchase_total)
-                year_profit += current_sale_total - purchase_total
+                single_sale_summary(
+                    current_sale_total, purchase_total, current_sale_exchange_rate
+                )
+                profit = current_sale_total - purchase_total
+                profit_eur = profit / current_sale_exchange_rate
+                year_profit += profit
+                year_profit_eur += profit_eur
 
             purchase_total = D(0)
             current_sale = e["sale_id"]
+            current_sale_exchange_rate = D(e["sale_gbpeur_rate"])
             current_sale_total = D(e["sale_total"])
 
             print()
             print(f"Sale of {e['sale_assetcode']}")
             print(
-                f"    Sell ({e['sale_date']}): {qty(e['sale_quantity']):19.4f} units @ {D(e['sale_price']):12.4f} = {D(e['sale_total']):12.4f}"
+                f"    Sell ({e['sale_date']}): {qty(e['sale_quantity']):19.4f} @ {D(e['sale_price']):9.4f} = {D(e['sale_total']):12.4f}"
             )
 
         reconciled_proportion = D(e["reconciliation_quantity"]) / D(
@@ -125,13 +149,16 @@ def capital_gains_summary(conn, year):
         reconciled_total = reconciled_proportion * D(e["purchase_total"])
         purchase_total += reconciled_total
         print(
-            f"    Buy  ({e['purchase_date']}): {qty(e['reconciliation_quantity']):9.4f}/{qty(e['purchase_quantity']):9.4f} units @ {D(e['purchase_price']):12.4f} = {reconciled_total:12.4f}"
+            f"    Buy  ({e['purchase_date']}): {qty(e['reconciliation_quantity']):9.4f}/{qty(e['purchase_quantity']):9.4f} @ {D(e['purchase_price']):9.4f} = {reconciled_total:12.4f}"
         )
 
-    single_sale_summary(current_sale_total, purchase_total)
-    year_profit += current_sale_total - purchase_total
+    single_sale_summary(current_sale_total, purchase_total, current_sale_exchange_rate)
+    profit = current_sale_total - purchase_total
+    profit_eur = profit / current_sale_exchange_rate
+    year_profit += profit
+    year_profit_eur += profit_eur
 
-    return year_profit
+    return year_profit, year_profit_eur
 
 
 def main():
@@ -157,16 +184,19 @@ def main():
     print("Dividends")
     print("---------")
     print()
-    dividends = dividends_summary(conn, args.year)
+    dividends, dividends_eur = dividends_summary(conn, args.year)
 
     print()
     print("Capital gains")
     print("-------------")
-    capital_gains = capital_gains_summary(conn, args.year)
+    capital_gains, capital_gains_eur = capital_gains_summary(conn, args.year)
 
     print()
     print(f"Total dividends            {dividends:12.4f}")
     print(f"Total capital gains        {capital_gains:12.4f}")
+    print()
+    print(f"Total dividends (EUR)      {dividends_eur:12.4f}")
+    print(f"Total capital gains (EUR)  {capital_gains_eur:12.4f}")
 
 
 if __name__ == "__main__":
